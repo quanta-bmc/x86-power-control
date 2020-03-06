@@ -32,6 +32,7 @@ namespace power_control
 {
 static boost::asio::io_service io;
 std::shared_ptr<sdbusplus::asio::connection> conn;
+static std::shared_ptr<sdbusplus::asio::dbus_interface> bootIface;
 static std::shared_ptr<sdbusplus::asio::dbus_interface> hostIface;
 static std::shared_ptr<sdbusplus::asio::dbus_interface> chassisIface;
 static std::shared_ptr<sdbusplus::asio::dbus_interface> powerButtonIface;
@@ -47,7 +48,7 @@ static gpiod::line resetButtonMask;
 static bool nmiButtonMasked = false;
 
 const static constexpr int powerPulseTimeMs = 200;
-const static constexpr int forceOffPulseTimeMs = 15000;
+const static constexpr int forceOffPulseTimeMs = 6000;
 const static constexpr int resetPulseTimeMs = 500;
 const static constexpr int powerCycleTimeMs = 5000;
 const static constexpr int sioPowerGoodWatchdogTimeMs = 1000;
@@ -125,6 +126,16 @@ static void beep(const uint8_t& beepPriority)
         "xyz.openbmc_project.BeepCode", "/xyz/openbmc_project/BeepCode",
         "xyz.openbmc_project.BeepCode", "Beep", uint8_t(beepPriority));
 }
+
+enum class BootProgressStage
+{
+    Unspecified,
+    MemoryInit,
+    SecondaryProcInit,
+    PCIInit,
+    OSStart,
+    MotherboardInit,
+};
 
 enum class PowerState
 {
@@ -370,6 +381,39 @@ static uint64_t getCurrentTimeMs()
     currentTimeMs += static_cast<uint64_t>(time.tv_nsec) / 1000 / 1000;
 
     return currentTimeMs;
+}
+
+static constexpr std::string_view getBootProgressStage(const BootProgressStage stage)
+{
+    switch (stage)
+    {
+        case BootProgressStage::MemoryInit:
+            return "xyz.openbmc_project.State.Boot.Progress.ProgressStages.MemoryInit";
+            break;
+        case BootProgressStage::SecondaryProcInit:
+            return "xyz.openbmc_project.State.Boot.Progress.ProgressStages.SecondaryProcInit";
+            break;
+        case BootProgressStage::PCIInit:
+            return "xyz.openbmc_project.State.Boot.Progress.ProgressStages.PCIInit";
+            break;
+        case BootProgressStage::OSStart:
+            return "xyz.openbmc_project.State.Boot.Progress.ProgressStages.OSStart";
+            break;
+        case BootProgressStage::MotherboardInit:
+            return "xyz.openbmc_project.State.Boot.Progress.ProgressStages.MotherboardInit";
+            break;
+        case BootProgressStage::Unspecified:
+        default:
+            return "xyz.openbmc_project.State.Boot.Progress.ProgressStages.Unspecified";
+            break;
+    }
+};
+static void setBootProgress(const BootProgressStage stage)
+{
+    bootIface->set_property("BootProgress",
+                            std::string(getBootProgressStage(stage)));
+    std::cerr << "Moving boot progress to \""
+            << std::string(getBootProgressStage(stage)) << "\" stage.\n";
 }
 
 static constexpr std::string_view getHostState(const PowerState state)
@@ -1432,8 +1476,13 @@ static void powerStateWaitForPSPowerOK(const Event event)
             // Cancel any GPIO assertions held during the transition
             gpioAssertTimer.cancel();
             psPowerOKWatchdogTimer.cancel();
+            if (power_control::sioPowerGoodLine)
+            {
             sioPowerGoodWatchdogTimerStart();
             setPowerState(PowerState::waitForSIOPowerGood);
+            }
+            else
+                setPowerState(PowerState::on);
             break;
         case Event::psPowerOKWatchdogTimerExpired:
             setPowerState(PowerState::failedTransitionToOn);
@@ -1504,7 +1553,10 @@ static void powerStateOff(const Event event)
     switch (event)
     {
         case Event::psPowerOKAssert:
+            if (power_control::sioPowerGoodLine)
             setPowerState(PowerState::waitForSIOPowerGood);
+            else
+                setPowerState(PowerState::on);
             break;
         case Event::sioS5DeAssert:
             setPowerState(PowerState::waitForPSPowerOK);
@@ -1968,11 +2020,13 @@ static void postCompleteHandler()
     {
         sendPowerControlEvent(Event::postCompleteAssert);
         osIface->set_property("OperatingSystemState", std::string("Standby"));
+        setBootProgress(BootProgressStage::OSStart);
     }
     else
     {
         sendPowerControlEvent(Event::postCompleteDeAssert);
         osIface->set_property("OperatingSystemState", std::string("Inactive"));
+        setBootProgress(BootProgressStage::Unspecified);
     }
     postCompleteEvent.async_wait(
         boost::asio::posix::stream_descriptor::wait_read,
@@ -2013,28 +2067,19 @@ int main(int argc, char* argv[])
     }
 
     // Request SIO_POWER_GOOD GPIO events
-    if (!power_control::requestGPIOEvents(
+    power_control::requestGPIOEvents(
             "SIO_POWER_GOOD", power_control::sioPowerGoodHandler,
-            power_control::sioPowerGoodLine, power_control::sioPowerGoodEvent))
-    {
-        return -1;
-    }
+            power_control::sioPowerGoodLine, power_control::sioPowerGoodEvent);
 
     // Request SIO_ONCONTROL GPIO events
-    if (!power_control::requestGPIOEvents(
+    power_control::requestGPIOEvents(
             "SIO_ONCONTROL", power_control::sioOnControlHandler,
-            power_control::sioOnControlLine, power_control::sioOnControlEvent))
-    {
-        return -1;
-    }
+            power_control::sioOnControlLine, power_control::sioOnControlEvent);
 
     // Request SIO_S5 GPIO events
-    if (!power_control::requestGPIOEvents("SIO_S5", power_control::sioS5Handler,
+    power_control::requestGPIOEvents("SIO_S5", power_control::sioS5Handler,
                                           power_control::sioS5Line,
-                                          power_control::sioS5Event))
-    {
-        return -1;
-    }
+                                          power_control::sioS5Event);
 
     // Request POWER_BUTTON GPIO events
     if (!power_control::requestGPIOEvents(
@@ -2112,6 +2157,42 @@ int main(int argc, char* argv[])
     std::cerr << "Initializing power state. ";
     power_control::logStateTransition(power_control::powerState);
 
+    // Boot Progress Service
+    sdbusplus::asio::object_server bootServer =
+        sdbusplus::asio::object_server(power_control::conn);
+
+    // Boot Progress Interface
+    power_control::bootIface = bootServer.add_interface(
+        "/xyz/openbmc_project/state/host0", "xyz.openbmc_project.State.Boot.Progress");
+
+    power_control::bootIface->register_property(
+        "BootProgress",
+        std::string("xyz.openbmc_project.State.Boot.Progress.ProgressStages.Unspecified"),
+        [](const std::string& requested, std::string& resp) {
+            if (requested == "xyz.openbmc_project.State.Boot.Progress.ProgressStages.MemoryInit")
+            {
+            }
+            else if (requested == "xyz.openbmc_project.State.Boot.Progress.ProgressStages.SecondaryProcInit")
+            {
+            }
+            else if (requested == "xyz.openbmc_project.State.Boot.Progress.ProgressStages.PCIInit")
+            {
+            }
+            else if (requested == "xyz.openbmc_project.State.Boot.Progress.ProgressStages.OSStart")
+            {
+            }
+            else if (requested == "xyz.openbmc_project.State.Boot.Progress.ProgressStages.MotherboardInit")
+            {
+            }
+            else
+            {
+            }
+            resp = requested;
+            return 1;
+        });
+
+    power_control::bootIface->initialize();
+
     // Power Control Service
     sdbusplus::asio::object_server hostServer =
         sdbusplus::asio::object_server(power_control::conn);
@@ -2127,7 +2208,7 @@ int main(int argc, char* argv[])
             if (requested == "xyz.openbmc_project.State.Host.Transition.Off")
             {
                 sendPowerControlEvent(
-                    power_control::Event::gracefulPowerOffRequest);
+                    power_control::Event::powerOffRequest);
                 addRestartCause(power_control::RestartCause::command);
             }
             else if (requested ==
