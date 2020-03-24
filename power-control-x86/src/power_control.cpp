@@ -2281,6 +2281,12 @@ int main(int argc, char* argv[])
                 sendPowerControlEvent(power_control::Event::powerCycleRequest);
                 addRestartCause(power_control::RestartCause::command);
             }
+            else if (requested ==
+                         "xyz.openbmc_project.State.Chassis.Transition.Reset")
+              {
+                sendPowerControlEvent(power_control::Event::resetRequest);
+                addRestartCause(power_control::RestartCause::command);
+              }
             else
             {
                 std::cerr << "Unrecognized chassis state transition request.\n";
